@@ -12,6 +12,7 @@ from deadline.util import encode_multipart_formdata
 
 FLUSH_EVENTS = 1
 
+FORCE_TICK = 20
 
 class Manager(object):
     def log(self, msg):
@@ -23,8 +24,11 @@ class Manager(object):
         self._listeners = {}
         self._last_flush = None
         self._first_event_time = None
+        self.periodic = tornado.ioloop.PeriodicCallback( self.tick, FORCE_TICK * 1000 )
+        self.periodic.start()
 
-    def tick(self, t):
+    def tick(self, t=None):
+        if t is None: t = time.time()
         if not self._first_event_time:
             self._first_event_time = t
         if self._last_flush:
@@ -39,7 +43,7 @@ class Manager(object):
         d = {}
         for stat in self._stats:
             if stat.ready_for_consume(t):
-                d[stat.name] = (stat.meta(), stat.consume())
+                d[stat.name] = (stat.meta(), stat.consume(t))
         self._last_flush = t
         content_type, body = encode_multipart_formdata( (k,json.dumps(v)) for k,v in d.items() )
 
@@ -116,7 +120,7 @@ class Gauge(object):
         if self._values:
             return True
 
-    def consume(self):
+    def consume(self,t=None):
         v = self._values
         self._values = []
         return v
@@ -129,6 +133,8 @@ class Count(object):
         self.max_value = max_value
         self.name = name
 
+        self.windows = []
+
         self.current_window_begin = time.time()
         self.counter = 0
         manager.register(self)
@@ -137,24 +143,40 @@ class Count(object):
         return 'Count'
 
     def ready_for_consume(self, t=None):
-        if not t: t = time.time()
-        return t - self.current_window_begin > self.max_window or (self.max_value and self.counter >= self.max_value)
+        if t is None: t = time.time()
+        return len(self.windows) > 0 or t - self.current_window_begin > self.max_window or (self.max_value and self.counter >= self.max_value)
 
-    def consume(self):
-        t = time.time()
+    def consume(self,t=None):
+        if t is None: t = time.time()
         # return the time window and the count inside the window
-        toreturn = [ (self.current_window_begin, t), self.counter ]
+        #toreturn = [ (self.current_window_begin, t), self.counter ]
+        self.try_consume_window(0, t)
+        toreturn = self.windows
 
         # reset the values for a new count interval
-        self.current_window_begin = t
-        self.counter = 0
+        #self.current_window_begin = t
+        #self.counter = 0
+        self.windows = []
 
         return toreturn
 
+    def try_consume_window(self, val=0, t=None):
+        if t is None: t=time.time()
+
+        if t - self.current_window_begin > self.max_window:
+            # need to make a new window
+            window = [ (self.current_window_begin, t), self.counter ]
+            self.windows.append( window )
+            self.counter = 0
+            self.current_window_begin = t
+
+        self.counter += val
+        
     def increment(self, val=1):
         t = time.time()
-        self.counter += val
-        if self.ready_for_consume(t):
-            manager.tick(t)
+        self.try_consume_window(val,t)
+
+        #if self.ready_for_consume(t):
+        #    manager.tick(t)
             
         
