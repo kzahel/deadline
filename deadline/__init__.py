@@ -128,7 +128,7 @@ class Gauge(object):
 
     
 class Count(object):
-    def __init__(self, name, max_window = 10, max_value=None):
+    def __init__(self, name, max_window = 1, max_value=None):
         self.max_window = max_window
         self.max_value = max_value
         self.name = name
