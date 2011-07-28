@@ -1,8 +1,8 @@
 import tornado.ioloop
 import time
 ioloop = tornado.ioloop.IOLoop.instance()
-#import tornado.options
-#tornado.options.parse_command_line()
+from tornado.options import options, parse_command_line
+#parse_command_line()
 import tornado.httpclient
 import logging
 import json
@@ -10,14 +10,17 @@ httpclient = tornado.httpclient.AsyncHTTPClient()
 
 from deadline.util import encode_multipart_formdata
 
-FLUSH_EVENTS = 5
+FLUSH_EVENTS = 1
 
 
 class Manager(object):
+    def log(self, msg):
+        logging.info('deadline manager: %s' % msg)
+
     def __init__(self, host):
         self._host = host
         self._stats = []
-        self._listeners = []
+        self._listeners = {}
         self._last_flush = None
         self._first_event_time = None
 
@@ -32,9 +35,11 @@ class Manager(object):
                 self.flush(t)
 
     def flush(self,t):
+        logging.info('flushing events!')
         d = {}
         for stat in self._stats:
-            d[stat.name] = (stat.meta(), stat.consume())
+            if stat.ready_for_consume(t):
+                d[stat.name] = (stat.meta(), stat.consume())
         self._last_flush = t
         content_type, body = encode_multipart_formdata( (k,json.dumps(v)) for k,v in d.items() )
 
@@ -47,29 +52,40 @@ class Manager(object):
         httpclient.fetch(req, self.flushed)
 
     def process(self, key, data):
+        # called by the handler that receives the data
         meta, values = data
-        logging.info('processing data for %s, %s' % (meta, values))
+        if options.verbose > 0:
+            self.log('processing data for %s, %s, %s' % (key, meta, values))
         
         if key in self._listeners:
             closed_listeners = []
-            for callback in self._listeners[key]:
-                retval = callback(values)
+            for listener in self._listeners[key]:
+                retval = listener.on_new_data(values)
                 if retval:
-                    closed_listeners.append(callback)
+                    closed_listeners.append(listener)
             for todelete in closed_listeners:
                 self._listeners[key].remove(closed_listeners)
 
     def flushed(self, response):
         if response.error:
-            logging.error('got flush response %s' % response)
+            self.log('got flush response %s' % response)
 
     def register(self, stat):
         self._stats.append(stat)
 
-    def add_listener(self, key, callback):
+    def add_listener(self, listener):
+        key = listener.key
         if key not in self._listeners:
             self._listeners[key] = []
-        self._listeners[key].append(callback)
+        self._listeners[key].append(listener)
+        self.log('added listener %s' % listener)
+
+    def remove_listener(self, listener):
+        key = listener.key
+        if key in self._listeners:
+            if listener in self._listeners[key]:
+                self._listeners[key].remove(listener)
+                self.log('removed listener %s' % listener)
 
 manager = Manager('http://127.0.0.1:8006')
 
@@ -96,6 +112,10 @@ class Gauge(object):
         self._values.append( (t,v) )
         manager.tick(t)
 
+    def ready_for_consume(self,t):
+        if self._values:
+            return True
+
     def consume(self):
         v = self._values
         self._values = []
@@ -103,3 +123,38 @@ class Gauge(object):
 
 
     
+class Count(object):
+    def __init__(self, name, max_window = 10, max_value=None):
+        self.max_window = max_window
+        self.max_value = max_value
+        self.name = name
+
+        self.current_window_begin = time.time()
+        self.counter = 0
+        manager.register(self)
+
+    def meta(self):
+        return 'Count'
+
+    def ready_for_consume(self, t=None):
+        if not t: t = time.time()
+        return t - self.current_window_begin > self.max_window or (self.max_value and self.counter >= self.max_value)
+
+    def consume(self):
+        t = time.time()
+        # return the time window and the count inside the window
+        toreturn = [ (self.current_window_begin, t), self.counter ]
+
+        # reset the values for a new count interval
+        self.current_window_begin = t
+        self.counter = 0
+
+        return toreturn
+
+    def increment(self, val=1):
+        t = time.time()
+        self.counter += val
+        if self.ready_for_consume(t):
+            manager.tick(t)
+            
+        
