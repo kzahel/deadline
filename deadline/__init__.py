@@ -14,6 +14,8 @@ FLUSH_EVENTS = 1
 
 FORCE_TICK = 20
 
+DEFAULT_COUNT_WINDOW = 1
+
 class Manager(object):
     def log(self, msg):
         logging.info('deadline manager: %s' % msg)
@@ -39,27 +41,34 @@ class Manager(object):
                 self.flush(t)
 
     def flush(self,t):
-        logging.info('flushing events!')
+        if not self._host:
+            logging.info('not flushing events -- no master host')
+            return
+        #logging.info('flushing events!')
         d = {}
         for stat in self._stats:
             if stat.ready_for_consume(t):
                 d[stat.name] = (stat.meta(), stat.consume(t))
         self._last_flush = t
         content_type, body = encode_multipart_formdata( (k,json.dumps(v)) for k,v in d.items() )
-
+        
         req = tornado.httpclient.HTTPRequest('%s/stats' % self._host,
                                              method = 'POST',
                                              log_request = False,
-                                             headers = { 'Content-Type': content_type },
+                                             headers = { 'Content-Type': content_type, 'Source':'%s:%s' % (options.attach_hostname, options.frontend_port) },
                                              body = body)
         #logging.info('flushing %s' % body)
         httpclient.fetch(req, self.flushed)
 
-    def process(self, key, data):
+    def process(self, key, data, opts = None):
         # called by the handler that receives the data
         meta, values = data
         if options.verbose > 0:
-            self.log('processing data for %s, %s, %s' % (key, meta, values))
+            self.log('processing data for %s, %s, %s (with opts: %s)' % (key, meta, values, opts))
+
+
+        # XXX!!! aggregate across sources!
+
         
         if key in self._listeners:
             closed_listeners = []
@@ -91,7 +100,10 @@ class Manager(object):
                 self._listeners[key].remove(listener)
                 self.log('removed listener %s' % listener)
 
-manager = Manager('http://127.0.0.1:8006')
+if 'deadline_master' in options:
+    manager = Manager(options.deadline_master)
+else:
+    manager = Manager('http://127.0.0.1:8006')
 
 class Gauge(object):
     def __init__(self, name, poll_interval, poll_fn):
@@ -128,7 +140,7 @@ class Gauge(object):
 
     
 class Count(object):
-    def __init__(self, name, max_window = 1, max_value=None):
+    def __init__(self, name, max_window = DEFAULT_COUNT_WINDOW, max_value=None):
         self.max_window = max_window
         self.max_value = max_value
         self.name = name
