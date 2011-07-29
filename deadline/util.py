@@ -3,6 +3,8 @@ def encode_multipart_formdata(fields):
     fields is a sequence of (name, value) elements for regular form fields.
     Return (content_type, body) ready for httplib.HTTP instance
     """
+    if len(fields) == 0:
+        return None, ''
     BOUNDARY = '----------ThIs_Is_tHe_bouNdaRY_$'
     CRLF = '\r\n'
     L = []
