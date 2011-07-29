@@ -77,7 +77,8 @@ class Manager(object):
             opts_str = ''
             if opts and opts['Source']:
                 opts_str = 'from %s' % opts['Source']
-            #self.log('processing data %s for %s, %s, %s' % (opts_str, key, meta, values))
+            if options.verbose > 2:
+                self.log('processing data %s for %s, %s, %s' % (opts_str, key, meta, values))
 
         # Aggregate across sources!
         if key not in self._stats:
