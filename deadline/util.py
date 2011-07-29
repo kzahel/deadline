@@ -5,7 +5,7 @@ def encode_multipart_formdata(fields):
     """
     if len(fields) == 0:
         return None, ''
-    BOUNDARY = '----------ThIs_Is_tHe_bouNdaRY_$'
+    BOUNDARY = '--tiEEnybdry_$'
     CRLF = '\r\n'
     L = []
     for (key, value) in fields:

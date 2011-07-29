@@ -17,6 +17,8 @@ FORCE_TICK = 3
 
 DEFAULT_COUNT_WINDOW = 1
 
+DEADLINE = 2 # number of windows behind for aggregation
+
 class Manager(object):
     def log(self, msg):
         logging.info('manager: %s' % msg)
@@ -48,13 +50,13 @@ class Manager(object):
 
     def flush(self,t):
         if not self._host:
-            #logging.info('not flushing events -- no master host')
+            logging.info('not flushing events -- no master host')
             return
         #logging.info('flushing events!')
         d = {}
         for key, stat in self._stats.items():
             if stat.ready_for_consume(t) and stat.active:
-                d[stat.name] = (stat.meta(), stat.consume(t))
+                d[stat.name] = (stat.meta(), stat.consume(t, upstream_flush=True)) # stat gets consumed!!!
         self._last_flush = t
         content_type, body = encode_multipart_formdata( [(k,json.dumps(v)) for k,v in d.items()] )
         headers = {'Source':self._source }
@@ -65,7 +67,7 @@ class Manager(object):
                                              log_request = False,
                                              headers = headers,
                                              body = body)
-        #logging.info('flushing %s' % body)
+        #logging.info('flushing to %s/stats, %s' % (self._host, body))
         httpclient.fetch(req, self.flushed)
 
     def process(self, key, data, opts = None):
@@ -75,28 +77,45 @@ class Manager(object):
             opts_str = ''
             if opts and opts['Source']:
                 opts_str = 'from %s' % opts['Source']
-            self.log('processing data %s for %s, %s, %s' % (opts_str, key, meta, values))
-
-        if options.deadline_master:
-            if key not in self._stats:
-                meta = data[0]
-                cls = globals()[meta[0]]
-                instance = cls(key)
-                instance.merge_data(data, opts)
-                self._stats[key] = instance
-            else:
-                instance = self._stats[key]
-                instance.merge_data(data, opts)
+            #self.log('processing data %s for %s, %s, %s' % (opts_str, key, meta, values))
 
         # XXX!!! aggregate across sources!
+
+        if key not in self._stats:
+            meta = data[0]
+            cls = globals()[meta[0]]
+            if meta[0] == 'Gauge':
+                opts['poll_interval'] = meta[1]
+            instance = cls(key, **opts)
+            instance.merge_data(data, opts)
+            self._stats[key] = instance
+        else:
+            instance = self._stats[key]
+            instance.merge_data(data, opts)
+
+
         # XXX!!! stick into _stats
-        
+        if False:
+            if key in self._listeners:
+                closed_listeners = []
+                for listener in self._listeners[key]:
+                    retval = listener.on_new_data(values)
+                    if retval:
+                        closed_listeners.append(listener)
+                for todelete in closed_listeners:
+                    self._listeners[key].remove(closed_listeners)
+
+    def push_new_data(self, key):
+        #logging.info('push new data please for %s' % key)
         if key in self._listeners:
             closed_listeners = []
             for listener in self._listeners[key]:
-                retval = listener.on_new_data(values)
-                if retval:
-                    closed_listeners.append(listener)
+                newvals = self._stats[key].push_new_values()
+                if newvals:
+                    #logging.info('got some newvals for %s, %s' % (key, newvals))
+                    retval = listener.on_new_data(newvals)
+                    if retval:
+                        closed_listeners.append(listener)
             for todelete in closed_listeners:
                 self._listeners[key].remove(closed_listeners)
 
@@ -130,7 +149,11 @@ else:
     manager = Manager('http://127.0.0.1:8006')
 
 class Gauge(object):
-    def __init__(self, name, poll_interval=None, poll_fn=None, active=True):
+    def __init__(self, name, poll_interval=None, poll_fn=None, active=True, Source=None):
+
+        self.frontend_push_deadline = None
+        self.upstream_push_deadline = None
+
         if not active:
             return
         self._values = []
@@ -140,8 +163,13 @@ class Gauge(object):
         self.poll_interval = poll_interval
         self.poll_fn = poll_fn
         if self.poll_interval:
-            self.periodic = tornado.ioloop.PeriodicCallback( self.poll, self.poll_interval*1000 )
-            self.periodic.start()
+            if poll_fn:
+                self.periodic = tornado.ioloop.PeriodicCallback( self.poll, self.poll_interval*1000 )
+                self.periodic.start()
+            else:
+                # aggregating only!
+                self.periodic = tornado.ioloop.PeriodicCallback( self.do_merge, self.poll_interval*1000 )
+                self.periodic.start()
         manager.register(self)
 
     def meta(self):
@@ -152,29 +180,100 @@ class Gauge(object):
         #logging.info('polling for stat %s, got value %s' % (self, value))
         self.add_value(value)
 
-    def add_value(self, v):
-        t = time.time()
+    def add_value(self, v, t=None):
+        if t is None:t = time.time()
         self._values.append( (t,v) )
         manager.tick(t)
 
     def merge_data(self, data, opts):
         meta = data[0]
+        poll_interval = meta[1]
         source = opts['Source']
         self.poll_interval = meta[1]
         if source not in self._multivalues:
-            self._multivalues[source] = [data]
+            self._multivalues[source] = data[1]
         else:
-            self._multivalues[source] += data
+            self._multivalues[source] += data[1]
+        #logging.info('merged %s %s data %s' % (source, self.name, self._multivalues[source]))
+
+    def do_merge(self):
+        t = time.time()
+
+        total = 0
+
+        for source, arr_data in self._multivalues.iteritems():
+            #logging.info('source %s has hist values len %s' % (source, len(arr_data)))
+            found = False
+            for i, datapoint in enumerate(arr_data):
+                datatime = datapoint[0]
+                reltime = (t - DEADLINE * self.poll_interval)
+                diff = reltime - datatime
+                #logging.info('%s: compare %s - %s = %s' % (i, reltime, datatime, diff))
+                if diff > 0 and diff < self.poll_interval:
+                    # use this datapoint! (and cut off any datapoints previous to this one)
+                    found = True
+                    break
+            if found:
+                total += datapoint[1]
+                # arr_data = arr_data[i+1:] # does not mutate self._multivalues
+                if i > 0:
+                    logging.warn('cut off and lost some data! at index %s' % i)
+                self._multivalues[source] = arr_data[i+1:]
+        #logging.info('do merge adds value (%s,%s)' % (t, total))
+        self.add_value(total, t)
+        manager.push_new_data(self.name)
+
+    def push_new_values(self):
+        return self.consume( frontend_push = True )
 
     def ready_for_consume(self,t):
         if self._values:
             return True
 
-    def consume(self,t=None):
-        v = self._values
-        self._values = []
-        return v
+    def consume(self, t=None, upstream_flush=None, frontend_push=None):
+        if upstream_flush and 'service_identifier' not in options:
+            #logging.info('raptor consume!')
+            v = self._values
+            self._values = []
+            return v
+        else:
+            if t is None: t = time.time()
+            if frontend_push:
 
+                if self.frontend_push_deadline:
+                    # consume only the values greater than the last push deadline
+                    toreturn = filter(lambda x:x[0] > self.frontend_push_deadline, self._values)
+                else:
+                    # consume everything up to this point
+                    toreturn = self._values
+
+                self.frontend_push_deadline = t
+
+            elif upstream_flush:
+
+                if self.upstream_push_deadline:
+                    # consume only the values greater than the last push deadline
+                    toreturn = filter(lambda x:x[0] > self.upstream_push_deadline, self._values)
+                else:
+                    # consume everything up to this point
+                    toreturn = self._values
+
+                self.upstream_push_deadline = t
+
+            #logging.info('consuming %s from values of len %s' % (len(toreturn), len(self._values)))
+
+            self.delete_values_older_than( t - 2 * (DEADLINE + FLUSH_EVENTS) * self.poll_interval )
+
+            return toreturn
+            # do some garbage collection pls!!! !!! ! ! ! ! ! ! ! ! !!!!
+
+    def delete_values_older_than(self, t):
+        for i in range(len(self._values)):
+            if self._values[i][0] < t:
+                break
+
+        self._values = self._values[i:]
+                
 
     
 class Count(object):
