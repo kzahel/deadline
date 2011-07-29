@@ -86,8 +86,10 @@ class Manager(object):
             cls = globals()[meta[0]]
             if meta[0] == 'Gauge':
                 opts['poll_interval'] = meta[1]
+            elif meta[0] == 'Count':
+                opts['max_window'] = meta[1]
+            logging.info('create %s with %s, %s' % (cls, key, opts))
             instance = cls(key, **opts)
-            logging.info('created %s with %s, %s' % (cls, key, opts))
             instance.merge_data(data, opts)
             self._stats[key] = instance
         else:
@@ -267,13 +269,24 @@ class Gauge(object):
 
     
 class Count(object):
-    def __init__(self, name, max_window = DEFAULT_COUNT_WINDOW, max_value=None, active=True):
+    def __init__(self, name, max_window = DEFAULT_COUNT_WINDOW, max_value=None, active=True, Source=None):
+
+        self.frontend_push_deadline = None
+        self.upstream_push_deadline = None
+
         self.active = active
+        if not active:
+            return
+
         self.max_window = max_window
         self.max_value = max_value
         self.name = name
-
+        self._multivalues = {}
         self.windows = []
+
+        if self.max_window and 'attach_hostname' not in options:
+            self.periodic = tornado.ioloop.PeriodicCallback( self.do_merge, self.max_window*1000 )
+            self.periodic.start()
 
         self.current_window_begin = time.time()
         self.counter = 0
@@ -287,9 +300,76 @@ class Count(object):
         return len(self.windows) > 0 or t - self.current_window_begin > self.max_window or (self.max_value and self.counter >= self.max_value)
 
     def merge_data(self, data, opts):
-        pass
+        #logging.info('merge data %s into %s!' % (data, self))
 
-    def consume(self,t=None):
+        meta = data[0]
+        max_window = meta[1]
+        source = opts['Source']
+        self.poll_interval = meta[1]
+        if source not in self._multivalues:
+            self._multivalues[source] = data[1]
+        else:
+            self._multivalues[source] += data[1]
+        logging.info('merged %s %s data %s' % (source, self.name, self._multivalues[source]))
+
+    def intervals_intersect(self, a, b):
+        return a[0] <= b[1] and b[0] <= a[1]
+
+    def how_much_fits_into(self, a, b):
+        if a[0] < b[0]:
+            return (a[1] - b[0]) / float(a[1] - a[0])
+        elif a[1] < b[1]:
+            return 1
+        else:
+            return (b[1] - a[0]) / float(a[1] - a[0])
+
+    def do_merge(self):
+        t = time.time()
+        t0 = t - self.max_window
+
+        targetwindow = ( t - DEADLINE * self.max_window, 
+                         t - DEADLINE * self.max_window - self.max_window )
+
+        total = 0
+        
+        for source, arr_data in self._multivalues.iteritems():
+            #logging.info('source %s has hist values len %s' % (source, len(arr_data)))
+            found = False
+            stopped_finding = False
+
+            for i, datapoint in enumerate(arr_data):
+                datainterval = datapoint[0]
+
+                if self.intervals_intersect(datainterval, targetwindow):
+                    found = True
+                    fraction = self.how_much_fits_into(datainterval, targetwindow)
+                    logging.error('intervals %s %s intersect! fraction %s of %s' % (targetwindow, datainterval, fraction, datapoint))
+                    total += fraction * datapoint[1]
+
+                else:
+                    logging.info('intervals %s %s did not intersect' % (targetwindow, datainterval))
+                    if found:
+                        stopped_finding = True
+                    
+                if stopped_finding:
+                    break
+    
+            if found:
+                total += datapoint[1]
+                # arr_data = arr_data[i+1:] # does not mutate self._multivalues
+                if i > 0:
+                    logging.warn('cut off and lost some data! at index %s' % i)
+                self._multivalues[source] = arr_data[i:]
+
+
+        logging.info('total after do_merge %s' % total)
+        if total > 0:
+            logging.info('do merge adds value (%s,%s)' % (t, total))
+
+            self.increment(total, t)
+            manager.push_new_data(self.name)
+
+    def consume(self,t=None, upstream_flush=None, frontend_push=None):
         if t is None: t = time.time()
         # return the time window and the count inside the window
         #toreturn = [ (self.current_window_begin, t), self.counter ]
@@ -303,6 +383,9 @@ class Count(object):
 
         return toreturn
 
+    def push_new_values(self):
+        return self.consume( frontend_push = True )
+
     def try_consume_window(self, val=0, t=None):
         if t is None: t=time.time()
 
@@ -315,10 +398,12 @@ class Count(object):
 
         self.counter += val
         
-    def increment(self, val=1):
+    def increment(self, val=1, t=None):
         if not self.active: return
-        t = time.time()
+        if t is None: t = time.time()
         self.try_consume_window(val,t)
+
+        logging.info('windows now %s' % self.windows)
 
         #if self.ready_for_consume(t):
         #    manager.tick(t)
