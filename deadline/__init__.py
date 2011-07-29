@@ -50,7 +50,7 @@ class Manager(object):
 
     def flush(self,t):
         if not self._host:
-            logging.info('not flushing events -- no master host')
+            #logging.info('not flushing events -- no master host')
             return
         #logging.info('flushing events!')
         d = {}
@@ -79,31 +79,20 @@ class Manager(object):
                 opts_str = 'from %s' % opts['Source']
             #self.log('processing data %s for %s, %s, %s' % (opts_str, key, meta, values))
 
-        # XXX!!! aggregate across sources!
-
+        # Aggregate across sources!
         if key not in self._stats:
             meta = data[0]
             cls = globals()[meta[0]]
             if meta[0] == 'Gauge':
                 opts['poll_interval'] = meta[1]
             instance = cls(key, **opts)
+            logging.info('created %s with %s, %s' % (cls, key, opts))
             instance.merge_data(data, opts)
             self._stats[key] = instance
         else:
             instance = self._stats[key]
+            #logging.info('merge data %s into %s' % (data, instance))
             instance.merge_data(data, opts)
-
-
-        # XXX!!! stick into _stats
-        if False:
-            if key in self._listeners:
-                closed_listeners = []
-                for listener in self._listeners[key]:
-                    retval = listener.on_new_data(values)
-                    if retval:
-                        closed_listeners.append(listener)
-                for todelete in closed_listeners:
-                    self._listeners[key].remove(closed_listeners)
 
     def push_new_data(self, key):
         #logging.info('push new data please for %s' % key)
