@@ -112,7 +112,7 @@ class Manager(object):
                 self._listeners[key].remove(closed_listeners)
 
     def flushed(self, response):
-        if response.error:
+        if response.error and options.verbose > 2:
             self.log('got flush response %s' % response)
         else:
             if options.verbose > 3:
